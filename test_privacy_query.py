@@ -17,7 +17,7 @@ spec.loader.exec_module(q)
 
 class QueryTests(unittest.TestCase):
     def test_prompt_opens_terminal_for_writing_only(self):
-        with mock.patch("builtins.open", mock.mock_open()) as opened, mock.patch.object(q.getpass, "getpass", return_value="sample") as prompt:
+        with mock.patch.object(q, "IS_WINDOWS", False), mock.patch("builtins.open", mock.mock_open()) as opened, mock.patch.object(q.getpass, "getpass", return_value="sample") as prompt:
             self.assertEqual(q.prompt_private("Hidden: "), "sample")
             opened.assert_called_once_with("/dev/tty", "w", encoding="utf-8", buffering=1)
             prompt.assert_called_once()
@@ -25,7 +25,7 @@ class QueryTests(unittest.TestCase):
     def test_prompt_refuses_input_when_echo_cannot_be_disabled(self):
         def unsafe_fallback(*args, **kwargs):
             warnings.warn("input may echo", q.getpass.GetPassWarning)
-        with mock.patch("builtins.open", mock.mock_open()), mock.patch.object(q.getpass, "getpass", side_effect=unsafe_fallback):
+        with mock.patch.object(q, "IS_WINDOWS", False), mock.patch("builtins.open", mock.mock_open()), mock.patch.object(q.getpass, "getpass", side_effect=unsafe_fallback):
             with self.assertRaises(q.TerminalError):
                 q.prompt_private("Hidden: ")
 
@@ -192,6 +192,7 @@ class QueryTests(unittest.TestCase):
             self.assertIn("Saved session loaded", output.getvalue())
         q.logging.disable(q.logging.NOTSET)
 
+    @unittest.skipIf(os.name == "nt", "Unix permission checks")
     def test_session_is_private_and_password_not_written(self):
         with tempfile.TemporaryDirectory() as directory:
             old_dir, old_file = q.SESSION_DIR, q.SESSION_FILE
@@ -206,6 +207,7 @@ class QueryTests(unittest.TestCase):
             finally:
                 q.SESSION_DIR, q.SESSION_FILE = old_dir, old_file
 
+    @unittest.skipIf(os.name == "nt", "Unix permission checks")
     def test_session_symlink_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             old_dir, old_file = q.SESSION_DIR, q.SESSION_FILE

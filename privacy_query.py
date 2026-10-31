@@ -2,6 +2,7 @@
 """Read the two Beegram privacy settings using an owner-authenticated client."""
 import argparse
 import contextlib
+import csv
 import getpass
 import json
 import logging
@@ -9,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import subprocess
 import sys
 import tempfile
 import warnings
@@ -24,6 +26,7 @@ QUERY_FIELD_KEYS = (
 SETTINGS = ("hide_followers_following_list", "hide_self_from_others_lists")
 SESSION_DIR = Path(__file__).resolve().parent / ".session"
 SESSION_FILE = SESSION_DIR / "session.json"
+IS_WINDOWS = os.name == "nt"
 
 class SessionStorageError(Exception):
     pass
@@ -37,10 +40,12 @@ def prompt_private(prompt):
     try:
         # getpass opens the controlling terminal for input itself.  Its stream
         # is only used for the prompt; read/write buffered mode needs seeking.
-        try:
-            tty = open("/dev/tty", "w", encoding="utf-8", buffering=1)
-        except OSError:
-            tty = None
+        tty = None
+        if not IS_WINDOWS:
+            try:
+                tty = open("/dev/tty", "w", encoding="utf-8", buffering=1)
+            except OSError:
+                tty = None
         if tty is not None:
             output = tty
         elif sys.stdin.isatty() and sys.__stderr__ is not None and sys.__stderr__.isatty():
@@ -59,30 +64,101 @@ def prompt_private(prompt):
         raise TerminalError() from None
 
 
+def is_link_or_reparse_point(info):
+    attributes = getattr(info, "st_file_attributes", 0)
+    return stat.S_ISLNK(info.st_mode) or bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def windows_tool(name):
+    # Use absolute System32 paths: Windows searches the current directory for bare names.
+    return os.path.join(os.environ.get("SystemRoot") or r"C:\Windows", "System32", name)
+
+
+def windows_user_sid():
+    try:
+        result = subprocess.run(
+            [windows_tool("whoami.exe"), "/user", "/fo", "csv", "/nh"],
+            capture_output=True, text=True, errors="replace", check=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise SessionStorageError() from None
+    rows = list(csv.reader(result.stdout.strip().splitlines()))
+    sid = rows[0][-1].strip() if len(rows) == 1 and rows[0] else ""
+    if not re.fullmatch(r"S-1-\d+(-\d+)+", sid):
+        raise SessionStorageError()
+    return sid
+
+
+def windows_restrict(path, directory):
+    """Replace the ACL with a single full-control entry for the current user."""
+    sid = windows_user_sid()
+    grant = f"*{sid}:(OI)(CI)F" if directory else f"*{sid}:F"
+    icacls = windows_tool("icacls.exe")
+    for command in ([icacls, str(path), "/reset", "/q"],
+                    [icacls, str(path), "/inheritance:r", "/grant:r", grant, "/q"]):
+        try:
+            subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, check=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            raise SessionStorageError() from None
+
+
 def secure_directory():
     try:
         SESSION_DIR.mkdir(mode=0o700, exist_ok=True)
         info = SESSION_DIR.lstat()
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        if not stat.S_ISDIR(info.st_mode) or is_link_or_reparse_point(info):
             raise SessionStorageError()
-        os.chmod(SESSION_DIR, 0o700)
+        if IS_WINDOWS:
+            windows_restrict(SESSION_DIR, directory=True)
+        else:
+            if info.st_uid != os.geteuid():
+                raise SessionStorageError()
+            os.chmod(SESSION_DIR, 0o700)
     except OSError:
         raise SessionStorageError() from None
+
+
+def open_session_file():
+    if not IS_WINDOWS:
+        return os.open(SESSION_FILE, os.O_RDONLY | os.O_NOFOLLOW)
+    # Windows has no O_NOFOLLOW: reject links and reparse points, then confirm
+    # the opened handle is the same file that was checked.
+    before = os.lstat(SESSION_FILE)
+    if not stat.S_ISREG(before.st_mode) or is_link_or_reparse_point(before):
+        raise SessionStorageError()
+    fd = os.open(SESSION_FILE, os.O_RDONLY)
+    try:
+        if not os.path.samestat(before, os.fstat(fd)):
+            raise SessionStorageError()
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def restrict_session_file(fd, path, info):
+    if IS_WINDOWS:
+        windows_restrict(path, directory=False)
+    else:
+        if info.st_uid != os.geteuid():
+            raise SessionStorageError()
+        os.fchmod(fd, 0o600)
 
 
 def read_session():
     secure_directory()
     try:
-        fd = os.open(SESSION_FILE, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = open_session_file()
     except FileNotFoundError:
         return None
     except OSError:
         raise SessionStorageError() from None
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+        if not stat.S_ISREG(info.st_mode):
             raise SessionStorageError()
-        os.fchmod(fd, 0o600)
+        restrict_session_file(fd, SESSION_FILE, info)
         with os.fdopen(fd, "r", encoding="utf-8") as stream:
             fd = -1
             obj = json.load(stream)
@@ -109,11 +185,15 @@ def save_session(settings):
     name = None
     try:
         fd, name = tempfile.mkstemp(prefix=".session-", dir=SESSION_DIR)
-        os.fchmod(fd, 0o600)
+        try:
+            restrict_session_file(fd, name, os.fstat(fd))
+        except BaseException:
+            os.close(fd)
+            raise
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             json.dump(strip_passwords(settings), stream, separators=(",", ":"))
         os.replace(name, SESSION_FILE)
-    except (OSError, TypeError, ValueError):
+    except (OSError, TypeError, ValueError, SessionStorageError):
         if name:
             try:
                 os.unlink(name)
