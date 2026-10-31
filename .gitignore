@@ -1,0 +1,42 @@
+# Local authentication and private configuration
+.session/
+session*.json
+cookies.txt
+credentials.json
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.mobileconfig
+
+# Captures, diagnostic output, and app artifacts
+*.har
+*.pcap
+*.pcapng
+*.mitm
+*.flow
+*.log
+*.ipa
+*.zip
+*.dylib
+Payload/
+beegram-inspection/
+
+# Python environments and build output
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+build/
+dist/
+*.egg-info/
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
